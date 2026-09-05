@@ -6,6 +6,7 @@
 *.dylib
 bin/
 dist/
+/auth-cli
 
 # Secrets and tokens
 .env
