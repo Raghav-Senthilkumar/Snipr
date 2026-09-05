@@ -1,0 +1,19 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Secrets and tokens
+.env
+*.env
+token.json
+
+# Database & temp files
+*.db
+*.sqlite
+*.sqlite-journal
+*.log
