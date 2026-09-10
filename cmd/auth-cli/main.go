@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -54,8 +55,9 @@ func main() {
 		ClientSecret: clientSecret,
 		RedirectURI:  redirectURI,
 		Scopes: []string{
-			"clips:edit",     // Needed to create clips
+			"clips:edit",     // Needed to create clips via Helix API
 			"user:read:chat", // Needed to read chat via EventSub
+			"chat:read",      // Needed if connecting to IRC with OAuth
 		},
 	}
 
@@ -111,6 +113,24 @@ func main() {
 	if err != nil {
 		slog.Error("failed to validate access token with twitch", "error", err)
 		os.Exit(1)
+	}
+
+	// Save token locally for chat-cli to use
+	type savedToken struct {
+		ClientID     string `json:"client_id"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		Username     string `json:"username"`
+	}
+	saved := savedToken{
+		ClientID:     clientID,
+		AccessToken:  token.AccessToken,
+		RefreshToken: token.RefreshToken,
+		Username:     validation.Login,
+	}
+	if data, err := json.MarshalIndent(saved, "", "  "); err == nil {
+		_ = os.WriteFile("token.json", data, 0600)
+		slog.Info("saved credentials to token.json for chat-cli auto-detection")
 	}
 
 	slog.Info("user authenticated and validated",

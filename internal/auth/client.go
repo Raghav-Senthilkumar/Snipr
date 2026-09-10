@@ -39,6 +39,16 @@ func (c *Client) SetBaseURL(url string) {
 	c.baseURL = strings.TrimRight(url, "/")
 }
 
+// SetConfig updates the OAuth configuration.
+func (c *Client) SetConfig(cfg OAuthConfig) {
+	c.config = cfg
+}
+
+// GetConfig returns the OAuth configuration.
+func (c *Client) GetConfig() OAuthConfig {
+	return c.config
+}
+
 // GetAuthURL builds the Twitch authorization URL to open in the user's browser.
 func (c *Client) GetAuthURL(state string) string {
 	params := url.Values{}
