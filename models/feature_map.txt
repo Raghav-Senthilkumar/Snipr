@@ -1,0 +1,8 @@
+0 msg_count q
+1 unique_users q
+2 avg_msg_len q
+3 max_repeat_count q
+4 unique_norm_msgs q
+5 entropy_raw q
+6 hype_score q
+7 repeat_ratio q

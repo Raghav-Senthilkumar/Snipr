@@ -12,224 +12,158 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Raghav-Senthilkumar/Snipr/internal/analytics"
 	"github.com/Raghav-Senthilkumar/Snipr/internal/auth"
 	"github.com/Raghav-Senthilkumar/Snipr/internal/bus"
-	"github.com/Raghav-Senthilkumar/Snipr/internal/detector"
+	"github.com/Raghav-Senthilkumar/Snipr/internal/features"
 	"github.com/Raghav-Senthilkumar/Snipr/internal/ingest"
 	"github.com/Raghav-Senthilkumar/Snipr/internal/models"
+	"github.com/Raghav-Senthilkumar/Snipr/internal/pipeline"
+	"github.com/Raghav-Senthilkumar/Snipr/internal/predict"
+	"github.com/Raghav-Senthilkumar/Snipr/internal/store"
 	"github.com/Raghav-Senthilkumar/Snipr/internal/twitch"
 )
 
 func main() {
-	// 0. Auto-load .env file if present
 	_ = auth.LoadEnv(".env")
 
-	// Configure structured logger
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelWarn, // Keep stderr clean so chat & alerts stand out
-	}))
-	slog.SetDefault(logger)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn})))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	fmt.Println("==================================================")
-	fmt.Println("  SNIPR AUTO-CLIP & DETECTION ENGINE")
+	fmt.Println("  SNIPR — ValSparks-style pipeline (Go + NATS)")
+	fmt.Println("  IRC → NATS → [SQLite | Features | ES] → ML → Clip")
 	fmt.Println("==================================================")
 
-	// 1. Initialize TokenManager (auto-loads token.json, validates, refreshes, or logs in)
-	tokenMgr := auth.NewTokenManager(auth.ManagerConfig{
-		TokenFile: "token.json",
-	}, nil)
-
-	// Validate or refresh token immediately on boot
-	_, err := tokenMgr.EnsureValidToken(ctx)
-	if err != nil {
-		fmt.Printf("⚠️  [TWITCH AUTH NOTICE] %v\n", err)
-		fmt.Println("   Tip: Add TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET to a .env file to enable real Twitch clipping.")
+	// Auth + Helix
+	tokenMgr := auth.NewTokenManager(auth.ManagerConfig{TokenFile: "token.json"}, nil)
+	if _, err := tokenMgr.EnsureValidToken(ctx); err != nil {
+		fmt.Printf("WARN: [auth] %v\n", err)
+		fmt.Println("   Tip: TWITCH_CLIENT_ID / TWITCH_CLIENT_SECRET in .env; run auth-cli to log in.")
 	} else {
 		user, _ := tokenMgr.GetUser()
-		fmt.Printf("🔑 Twitch Authenticated as: %s (OAuth Verified)\n", user)
+		fmt.Printf("Authenticated as: %s\n", user)
 	}
 
-	// 2. Initialize Helix Client with dynamic TokenProvider
-	helixClient := twitch.NewHelixClient(tokenMgr.GetClientID(), "", nil)
-	helixClient.SetTokenProvider(tokenMgr.GetValidAccessToken)
+	helix := twitch.NewHelixClient(tokenMgr.GetClientID(), "", nil)
+	helix.SetTokenProvider(tokenMgr.GetValidAccessToken)
 
-	// 2. Initialize embedded NATS JetStream Event Bus (In-Memory)
-	eventBus, err := bus.NewNATSBus(bus.Config{
-		Port:       -1, // ephemeral random port
-		StreamName: "SNIPR_CHAT_STREAM",
-		MaxAge:     5 * time.Minute,
-		MaxBytes:   32 * 1024 * 1024, // 32MB RAM cap
-	})
+	// SQLite (ValSparks Postgres equivalent)
+	dbPath := os.Getenv("SNIPR_SQLITE_PATH")
+	if dbPath == "" {
+		dbPath = "snipr.db"
+	}
+	sqliteStore, err := store.Open(dbPath, store.DefaultBatchSize)
 	if err != nil {
-		fmt.Printf("Failed to initialize event bus: %v\n", err)
+		fmt.Printf("Failed to open sqlite: %v\n", err)
 		os.Exit(1)
 	}
+	defer sqliteStore.Close()
+	fmt.Printf("SQLite: %s (flush every %d messages)\n", dbPath, store.DefaultBatchSize)
 
-	// 3. Initialize Heuristic Detection Engine
-	engine := detector.NewEngine(detector.DefaultConfig())
-
-	var messageCount uint64
-	var showChat atomic.Bool
-	showChat.Store(true) // Display chat by default
-
-	// 4. Subscribe consumer to ALL channels via wildcard "chat.twitch.*"
-	sub, err := eventBus.SubscribeChat("*", func(msg models.ChatMessage) {
-		atomic.AddUint64(&messageCount, 1)
-
-		// Sync timestamp to local clock if Twitch server clock drifts by more than 10 seconds
-		now := time.Now().UTC()
-		if msg.Timestamp.IsZero() || now.Sub(msg.Timestamp).Abs() > 10*time.Second {
-			msg.Timestamp = now
-		}
-
-		// Feed message into detection engine
-		engine.ProcessMessage(msg)
-
-		// Only print if chat display is toggled on
-		if showChat.Load() {
-			emoteInfo := ""
-			if len(msg.Emotes) > 0 {
-				emoteInfo = fmt.Sprintf(" | Emotes: [%s]", strings.Join(msg.Emotes, ", "))
-			}
-			bitsInfo := ""
-			if msg.Bits > 0 {
-				bitsInfo = fmt.Sprintf(" | Bits: %d", msg.Bits)
-			}
-
-			// Print live message to console
-			fmt.Printf("[%s] %s: %s%s%s\n",
-				msg.Channel,
-				msg.UserName,
-				msg.Content,
-				emoteInfo,
-				bitsInfo,
-			)
-		}
-	})
+	// Elasticsearch
+	elasticCfg := analytics.DefaultConfig()
+	if esURL := os.Getenv("ELASTICSEARCH_URL"); esURL != "" {
+		elasticCfg.URL = esURL
+	}
+	elasticIndexer, err := analytics.NewElasticIndexer(elasticCfg, nil)
 	if err != nil {
-		fmt.Printf("Failed to subscribe consumer to chat stream: %v\n", err)
-		eventBus.Close()
-		os.Exit(1)
+		fmt.Printf("WARN: [elasticsearch] init: %v\n", err)
 	}
-	defer sub.Unsubscribe()
-
-	// 5. Connect Twitch IRC Ingestor
-	// Note: We use anonymous guest mode for IRC ingestion because it is bulletproof,
-	// never expires, and requires no IRC scopes. The OAuth token is reserved for Helix clipping!
-	opts := ingest.ClientOptions{}
-
-	client := ingest.NewClient(eventBus, opts)
-	if err := client.Connect(ctx); err != nil {
-		fmt.Printf("Failed to connect to Twitch IRC: %v\n", err)
-		eventBus.Close()
-		os.Exit(1)
-	}
-
-	// Start IRC read loop in background
-	go client.Start(ctx)
-
-	// 6. Pre-join 3 default streamers (or command-line args if provided)
-	initialStreamers := []string{"tarik", "shroud", "caedrel"}
-	if len(os.Args) > 1 {
-		initialStreamers = os.Args[1:]
-	}
-
-	fmt.Printf("Monitoring %d channels: %v\n", len(initialStreamers), initialStreamers)
-	fmt.Println("Commands:")
-	fmt.Println("  /chat (or /mute)     -> Toggle showing live chat messages on/off")
-	fmt.Println("  /clip <streamer>     -> Immediately create a real clip on Twitch")
-	fmt.Println("  /status <streamer>   -> Inspect live Z-Score, velocity & baseline")
-	fmt.Println("  /simulate <streamer> -> Inject synthetic hype burst to test trigger")
-	fmt.Println("  /add <streamer>      -> Join a new channel live")
-	fmt.Println("  /part <streamer>     -> Leave a channel")
-	fmt.Println("  /list                -> List active channels")
-	fmt.Println("  /stop                -> Gracefully stop engine and exit")
-	fmt.Println("==================================================")
-
-	for _, streamer := range initialStreamers {
-		_ = client.Join(streamer)
-	}
-
-	// 7. Background Evaluator Ticker: Evaluates each channel once per second
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case t := <-ticker.C:
-				now := t.UTC()
-				channels := client.GetChannels()
-				for _, ch := range channels {
-					event, triggered := engine.Evaluate(ch, now)
-					if triggered {
-						fmt.Println("\n========================================================")
-						fmt.Printf("🔥 [CLIP TRIGGERED] Hype moment detected on #%s!\n", ch)
-						fmt.Printf("   Reason:         %s\n", event.Reason)
-						fmt.Printf("   Recent Rate:    %.1f msgs/sec\n", event.Stats.RecentVelocity)
-						fmt.Printf("   Baseline Mean:  %.1f msgs/sec (StdDev: %.1f)\n", event.Stats.BaselineMean, event.Stats.BaselineStdDev)
-						fmt.Printf("   Z-Score:        %.2f\n", event.Stats.ZScore)
-						fmt.Printf("   Hype Emote %%:   %.0f%%\n", event.Stats.HypeRatio*100)
-						fmt.Printf("   Unique Users:   %d (Diversity: %.0f%%)\n", event.Stats.UniqueChatters, event.Stats.ChatterDiversity*100)
-						fmt.Printf("   ⏳ Waiting 8s capture delay (stream broadcast latency)...\n")
-						fmt.Println("========================================================")
-
-						// Trigger capture delay worker
-						go func(ev *detector.TriggerEvent) {
-							time.Sleep(8 * time.Second)
-
-							if !helixClient.IsConfigured() {
-								fmt.Println("\n--------------------------------------------------------")
-								fmt.Printf("🎬 [CLIP CAPTURE] Simulated clip for #%s (No Helix API Token)\n", ev.Channel)
-								fmt.Printf("   Simulated URL: https://clips.twitch.tv/simulated_%s_%d\n", ev.Channel, ev.TriggerTime.Unix())
-								fmt.Printf("   Entering 60s cooldown for #%s.\n", ev.Channel)
-								fmt.Println("--------------------------------------------------------")
-								return
-							}
-
-							fmt.Println("\n--------------------------------------------------------")
-							fmt.Printf("🎬 [CLIP CAPTURE] Calling Twitch Helix API for #%s...\n", ev.Channel)
-
-							bID, err := helixClient.GetUserID(ctx, ev.Channel)
-							if err != nil {
-								fmt.Printf("❌ Failed to resolve broadcaster ID for #%s: %v\n", ev.Channel, err)
-								fmt.Println("--------------------------------------------------------")
-								return
-							}
-
-							clipResp, err := helixClient.CreateClip(ctx, bID)
-							if err != nil {
-								fmt.Printf("❌ Twitch Helix create clip failed: %v\n", err)
-								fmt.Println("--------------------------------------------------------")
-								return
-							}
-
-							clipURL := fmt.Sprintf("https://clips.twitch.tv/%s", clipResp.ID)
-							fmt.Println("========================================================")
-							fmt.Printf("🎉 [REAL CLIP CREATED ON TWITCH!]\n")
-							fmt.Printf("   Streamer:  #%s (ID: %s)\n", ev.Channel, bID)
-							fmt.Printf("   Clip ID:   %s\n", clipResp.ID)
-							fmt.Printf("   👉 Watch:  %s\n", clipURL)
-							fmt.Printf("   👉 Edit:   %s\n", clipResp.EditURL)
-							fmt.Printf("   Cooldown:  60s active for #%s\n", ev.Channel)
-							fmt.Println("========================================================")
-						}(event)
-					}
-				}
-			}
+	defer func() {
+		if elasticIndexer != nil {
+			_ = elasticIndexer.Close()
 		}
 	}()
 
-	// 8. Setup OS signal handler for Ctrl+C
+	elasticOnline := false
+	if elasticIndexer != nil {
+		pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+		if err := elasticIndexer.Ping(pingCtx); err != nil {
+			fmt.Printf("WARN: [elasticsearch] offline: %v\n", err)
+			fmt.Println("   Tip: docker compose up -d")
+		} else if err := elasticIndexer.InitIndices(ctx); err != nil {
+			fmt.Printf("WARN: [elasticsearch] mapping: %v\n", err)
+		} else {
+			elasticOnline = true
+			fmt.Printf("Elasticsearch: %s\n", elasticCfg.URL)
+		}
+		pingCancel()
+	}
+
+	// ML model (drop dump_model JSON at models/mymodel.json)
+	modelPath := os.Getenv("SNIPR_MODEL_PATH")
+	if modelPath == "" {
+		modelPath = predict.DefaultModelPath
+	}
+	predictor, err := predict.LoadXGB(modelPath)
+	if err != nil {
+		fmt.Printf("WARN: [ml] load error: %v — continuing without clips\n", err)
+		predictor = predict.NewNoop(err.Error())
+	} else if predictor.Ready() {
+		fmt.Printf("ML model loaded: %s (threshold %.1f)\n", modelPath, predict.ProbThreshold)
+	} else if n, ok := predictor.(*predict.NoopPredictor); ok {
+		fmt.Printf("ML model: not ready (%s)\n", n.Reason())
+	}
+
+	// Embedded NATS (chat + features streams)
+	eventBus, err := bus.NewNATSBus(bus.Config{Port: -1})
+	if err != nil {
+		fmt.Printf("Failed to start NATS: %v\n", err)
+		os.Exit(1)
+	}
+	defer eventBus.Close()
+	fmt.Println("NATS: chat.twitch.* + features.twitch.*")
+
+	monitor := features.NewMonitor(eventBus)
+
+	var messageCount uint64
+	var showChat atomic.Bool
+	showChat.Store(true)
+
+	consumers, err := pipeline.Start(ctx, pipeline.Options{
+		Bus:           eventBus,
+		Store:         sqliteStore,
+		Monitor:       monitor,
+		Elastic:       elasticIndexer,
+		ElasticOnline: elasticOnline,
+		Helix:         helix,
+		Predictor:     predictor,
+		ShowChat:      &showChat,
+		MessageCount:  &messageCount,
+	})
+	if err != nil {
+		fmt.Printf("Failed to start consumers: %v\n", err)
+		os.Exit(1)
+	}
+	defer consumers.Stop()
+	fmt.Println("Consumers: sqlite | features(24s) | elasticsearch | predict→clip")
+
+	// IRC ingest
+	client := ingest.NewClient(eventBus, ingest.ClientOptions{})
+	if err := client.Connect(ctx); err != nil {
+		fmt.Printf("Failed to connect IRC: %v\n", err)
+		os.Exit(1)
+	}
+	go client.Start(ctx)
+
+	channels := []string{"tarik", "shroud", "caedrel"}
+	if len(os.Args) > 1 {
+		channels = os.Args[1:]
+	}
+	for _, ch := range channels {
+		_ = client.Join(ch)
+	}
+
+	fmt.Printf("Monitoring: %v\n", channels)
+	fmt.Println("Commands: /chat /clip /status /simulate /elastic /db /add /part /list /stop")
+	fmt.Println("==================================================")
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	// 9. Interactive console loop in a separate goroutine
 	inputCh := make(chan string)
 	go func() {
 		scanner := bufio.NewScanner(os.Stdin)
@@ -241,26 +175,24 @@ func main() {
 	running := true
 	for running {
 		select {
-		case sig := <-sigCh:
-			fmt.Printf("\nReceived signal %s. Shutting down...\n", sig)
+		case <-sigCh:
+			fmt.Println("\nShutting down...")
 			running = false
 
 		case input := <-inputCh:
 			if input == "" {
 				continue
 			}
-
 			parts := strings.Fields(input)
 			cmd := strings.ToLower(parts[0])
 
 			switch cmd {
 			case "/chat", "/mute", "/toggle":
-				current := showChat.Load()
-				showChat.Store(!current)
-				if !current {
-					fmt.Println(">> Chat display ENABLED. Raw messages will print.")
+				showChat.Store(!showChat.Load())
+				if showChat.Load() {
+					fmt.Println(">> Chat display ON")
 				} else {
-					fmt.Println(">> Chat display MUTED. Live messages hidden; detection engine still running!")
+					fmt.Println(">> Chat display OFF (pipeline still running)")
 				}
 
 			case "/clip":
@@ -268,37 +200,95 @@ func main() {
 					fmt.Println("Usage: /clip <channel>")
 					continue
 				}
-				channel := parts[1]
-				if !helixClient.IsConfigured() {
-					fmt.Println("⚠️  Twitch Helix API is not configured. Run `go run cmd/auth-cli/main.go` to log in.")
+				ch := parts[1]
+				if !helix.IsConfigured() {
+					fmt.Println("WARN: Helix not configured — run auth-cli first")
 					continue
 				}
+				go func(channel string) {
+					bID, err := helix.GetUserID(ctx, channel)
+					if err != nil {
+						fmt.Printf("ERROR: resolve #%s: %v\n", channel, err)
+						return
+					}
+					resp, err := helix.CreateClip(ctx, bID)
+					if err != nil {
+						fmt.Printf("ERROR: clip #%s: %v\n", channel, err)
+						return
+					}
+					fmt.Printf("Manual clip: https://clips.twitch.tv/%s\n   Edit: %s\n", resp.ID, resp.EditURL)
+				}(ch)
 
-				fmt.Printf("🎬 Calling Twitch Helix API to clip #%s on demand...\n", channel)
+			case "/status":
+				targets := client.GetChannels()
+				if len(parts) >= 2 {
+					targets = []string{strings.ToLower(strings.TrimPrefix(parts[1], "#"))}
+				}
+				now := time.Now().UTC()
+				fmt.Println("\n================= STATUS =================")
+				fmt.Printf("  Model ready: %v\n", predictor.Ready())
+				fmt.Printf("  Messages seen: %d\n", atomic.LoadUint64(&messageCount))
+				for _, t := range targets {
+					inCD, rem := consumers.IsInCooldown(t, now)
+					probStr := "n/a"
+					if v, ok := consumers.LastProb.Load(t); ok {
+						probStr = fmt.Sprintf("%.3f", v.(float64))
+					}
+					fmt.Printf("  #%s  last_prob=%s  cooldown=%v", t, probStr, inCD)
+					if inCD {
+						fmt.Printf(" (%s left)", rem.Round(time.Second))
+					}
+					fmt.Println()
+				}
+				fmt.Println("==========================================")
+
+			case "/simulate", "/hype":
+				target := "tarik"
+				if len(parts) >= 2 {
+					target = parts[1]
+				}
+				fmt.Printf("Injecting hype burst into #%s...\n", target)
 				go func(ch string) {
-					bID, err := helixClient.GetUserID(ctx, ch)
-					if err != nil {
-						fmt.Printf("❌ Failed to resolve broadcaster ID for #%s: %v\n", ch, err)
-						return
+					now := time.Now().UTC()
+					for i := 0; i < 40; i++ {
+						_ = eventBus.PublishChat(ctx, models.ChatMessage{
+							ID:        fmt.Sprintf("sim_%d_%d", now.UnixNano(), i),
+							Channel:   ch,
+							UserID:    fmt.Sprintf("sim_user_%d", i%12),
+							UserName:  fmt.Sprintf("SimFan%d", i%12),
+							Content:   "omg wtf holy wow insane kekw lmao cinema clean",
+							Timestamp: now,
+						})
+						time.Sleep(20 * time.Millisecond)
 					}
-					clipResp, err := helixClient.CreateClip(ctx, bID)
-					if err != nil {
-						fmt.Printf("❌ Twitch create clip failed: %v\n", err)
-						return
-					}
-					fmt.Printf("\n🎉 [REAL CLIP CREATED ON DEMAND!]\n   👉 Watch: https://clips.twitch.tv/%s\n   👉 Edit:  %s\n\n", clipResp.ID, clipResp.EditURL)
-				}(channel)
+				}(target)
+
+			case "/elastic", "/es":
+				if !elasticOnline || elasticIndexer == nil {
+					fmt.Println("Elasticsearch offline")
+					continue
+				}
+				stats := elasticIndexer.GetStats()
+				fmt.Printf("ES chat=%d clips=%d bulk=%d failed=%d\n",
+					stats.ChatIndexed, stats.ClipsIndexed, stats.BulkRequests, stats.FailedDocs)
+
+			case "/db", "/sqlite":
+				n, err := sqliteStore.Count(ctx)
+				if err != nil {
+					fmt.Printf("sqlite count error: %v\n", err)
+				} else {
+					fmt.Printf("SQLite rows: %d (%s)\n", n, dbPath)
+				}
 
 			case "/add", "/join":
 				if len(parts) < 2 {
 					fmt.Println("Usage: /add <channel>")
 					continue
 				}
-				channel := parts[1]
-				if err := client.Join(channel); err != nil {
-					fmt.Printf("Failed to join %s: %v\n", channel, err)
+				if err := client.Join(parts[1]); err != nil {
+					fmt.Printf("join failed: %v\n", err)
 				} else {
-					fmt.Printf("Successfully joined #%s!\n", channel)
+					fmt.Printf("Joined #%s\n", parts[1])
 				}
 
 			case "/part", "/leave":
@@ -306,83 +296,25 @@ func main() {
 					fmt.Println("Usage: /part <channel>")
 					continue
 				}
-				channel := parts[1]
-				if err := client.Part(channel); err != nil {
-					fmt.Printf("Failed to part %s: %v\n", channel, err)
+				if err := client.Part(parts[1]); err != nil {
+					fmt.Printf("part failed: %v\n", err)
 				} else {
-					fmt.Printf("Left #%s.\n", channel)
+					fmt.Printf("Left #%s\n", parts[1])
 				}
-
-			case "/status":
-				targets := client.GetChannels()
-				if len(parts) >= 2 {
-					targets = []string{strings.ToLower(strings.TrimPrefix(parts[1], "#"))}
-				}
-
-				if len(targets) == 0 {
-					fmt.Println("No active channels being monitored. Use /add <channel> to join one.")
-					continue
-				}
-
-				now := time.Now().UTC()
-				fmt.Println("\n================= LIVE METRICS =================")
-				for _, target := range targets {
-					stats := engine.GetStats(target, now)
-					inCD, cdRem := engine.IsInCooldown(target, now)
-					fmt.Printf("[#%s]\n", target)
-					fmt.Printf("  Recent 15s Msgs: %d (Velocity: %.1f msgs/sec)\n", stats.RecentMessages, stats.RecentVelocity)
-					fmt.Printf("  Baseline Mean:   %.1f msgs/sec (StdDev: %.1f)\n", stats.BaselineMean, stats.BaselineStdDev)
-					fmt.Printf("  Z-Score:         %.2f (Trigger threshold: 2.50)\n", stats.ZScore)
-					fmt.Printf("  Hype Emote %%:    %.0f%%\n", stats.HypeRatio*100)
-					fmt.Printf("  Unique Chatters: %d\n", stats.UniqueChatters)
-					fmt.Printf("  In Cooldown:     %v\n", inCD)
-					if inCD {
-						fmt.Printf("  Cooldown Left:   %v\n", cdRem.Round(time.Second))
-					}
-					fmt.Println("------------------------------------------------")
-				}
-
-			case "/simulate", "/hype":
-				target := "tarik"
-				if len(parts) >= 2 {
-					target = parts[1]
-				}
-				fmt.Printf("Injecting synthetic hype burst of 45 KEKW messages into #%s...\n", target)
-				go func(ch string) {
-					now := time.Now().UTC()
-					for i := 0; i < 45; i++ {
-						simMsg := models.ChatMessage{
-							ID:        fmt.Sprintf("sim_%d_%d", time.Now().UnixNano(), i),
-							Channel:   ch,
-							UserID:    fmt.Sprintf("sim_user_%d", i%15),
-							UserName:  fmt.Sprintf("SimFan%d", i%15),
-							Content:   "KEKW THAT WAS SICK KEKW",
-							Emotes:    []string{"KEKW", "KEKW"},
-							Timestamp: now,
-						}
-						_ = eventBus.PublishChat(ctx, simMsg)
-						time.Sleep(30 * time.Millisecond)
-					}
-				}(target)
 
 			case "/list", "/channels":
-				channels := client.GetChannels()
-				fmt.Printf("Currently monitoring (%d channels): %s\n", len(channels), strings.Join(channels, ", "))
+				fmt.Printf("Channels: %s\n", strings.Join(client.GetChannels(), ", "))
 
 			case "/stop", "/quit", "/exit":
-				fmt.Println("Stopping ingestion and closing event bus...")
 				running = false
 
 			default:
-				fmt.Printf("Unknown command: %s (Commands: /chat, /clip, /status, /simulate, /add, /part, /list, /stop)\n", cmd)
+				fmt.Printf("Unknown: %s\n", cmd)
 			}
 		}
 	}
 
-	// 10. Graceful Teardown: Stop client and close NATS bus
 	_ = client.Close()
-	eventBus.Close()
-
-	total := atomic.LoadUint64(&messageCount)
-	fmt.Printf("Done! Processed %d messages. Detection engine safely stopped.\n", total)
+	_ = sqliteStore.Flush(ctx)
+	fmt.Printf("Done. Processed %d messages.\n", atomic.LoadUint64(&messageCount))
 }

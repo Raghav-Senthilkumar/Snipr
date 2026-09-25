@@ -33,6 +33,8 @@ func openBrowser(url string) error {
 }
 
 func main() {
+	_ = auth.LoadEnv(".env")
+
 	// Configure default structured text logger
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
@@ -43,7 +45,7 @@ func main() {
 	clientSecret := os.Getenv("TWITCH_CLIENT_SECRET")
 
 	if clientID == "" || clientSecret == "" {
-		slog.Error("missing required credentials", "error", "TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET environment variables must be set")
+		slog.Error("missing required credentials", "error", "TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET must be set in .env or the environment")
 		os.Exit(1)
 	}
 

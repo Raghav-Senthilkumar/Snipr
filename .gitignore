@@ -19,3 +19,7 @@ token.json
 *.sqlite
 *.sqlite-journal
 *.log
+
+# Local venv used to convert XGBoost models
+.venv/
+snipr.db

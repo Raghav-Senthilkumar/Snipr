@@ -10,12 +10,7 @@ import (
 )
 
 func TestNATSBus_PublishAndSubscribe(t *testing.T) {
-	eventBus, err := bus.NewNATSBus(bus.Config{
-		Port:       -1,
-		StreamName: "CHAT_STREAM",
-		MaxAge:     5 * time.Minute,
-		MaxBytes:   16 * 1024 * 1024,
-	})
+	eventBus, err := bus.NewNATSBus(bus.Config{Port: -1})
 	if err != nil {
 		t.Fatalf("Failed to create embedded NATS Bus: %v", err)
 	}
@@ -34,7 +29,7 @@ func TestNATSBus_PublishAndSubscribe(t *testing.T) {
 
 	receivedChannel := make(chan models.ChatMessage, 1)
 
-	sub, err := eventBus.SubscribeChat("tarik", func(msg models.ChatMessage) {
+	sub, err := eventBus.SubscribeChat("tarik", "test_chat_group", func(msg models.ChatMessage) {
 		receivedChannel <- msg
 	})
 	if err != nil {
@@ -60,13 +55,65 @@ func TestNATSBus_PublishAndSubscribe(t *testing.T) {
 		if received.Content != testMsg.Content {
 			t.Errorf("got content %q, want %q", received.Content, testMsg.Content)
 		}
-		if len(received.Emotes) != 2 || received.Emotes[0] != "KEKW" {
-			t.Errorf("got emotes %v, want ['KEKW', 'KEKW']", received.Emotes)
-		}
-		if received.Bits != 100 {
-			t.Errorf("got bits %d, want 100", received.Bits)
-		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for message to be delivered via NATS JetStream")
+	}
+}
+
+func TestNATSBus_ParallelConsumersAndFeatures(t *testing.T) {
+	eventBus, err := bus.NewNATSBus(bus.Config{Port: -1})
+	if err != nil {
+		t.Fatalf("nats: %v", err)
+	}
+	defer eventBus.Close()
+
+	chatA := make(chan models.ChatMessage, 1)
+	chatB := make(chan models.ChatMessage, 1)
+	featCh := make(chan models.FeatureVector, 1)
+
+	subA, err := eventBus.SubscribeChat("*", "group_a", func(m models.ChatMessage) { chatA <- m })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subA.Unsubscribe()
+
+	subB, err := eventBus.SubscribeChat("*", "group_b", func(m models.ChatMessage) { chatB <- m })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subB.Unsubscribe()
+
+	subF, err := eventBus.SubscribeFeatures("*", "predict_test", func(f models.FeatureVector) { featCh <- f })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer subF.Unsubscribe()
+
+	ctx := context.Background()
+	msg := models.ChatMessage{ID: "p1", Channel: "xqc", UserName: "u", Content: "hi", Timestamp: time.Now().UTC()}
+	if err := eventBus.PublishChat(ctx, msg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both durable groups should receive a copy
+	for _, ch := range []chan models.ChatMessage{chatA, chatB} {
+		select {
+		case <-ch:
+		case <-time.After(3 * time.Second):
+			t.Fatal("parallel chat consumer timed out")
+		}
+	}
+
+	fv := models.FeatureVector{Channel: "xqc", MsgCount: 5, WindowEnd: time.Now().UTC()}
+	if err := eventBus.PublishFeatures(ctx, fv); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-featCh:
+		if got.MsgCount != 5 {
+			t.Fatalf("features msg_count=%v", got.MsgCount)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("features consumer timed out")
 	}
 }

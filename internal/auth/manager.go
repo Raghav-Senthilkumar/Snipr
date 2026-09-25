@@ -206,7 +206,7 @@ func (tm *TokenManager) loginViaBrowser(ctx context.Context) (*Token, error) {
 	}
 
 	fmt.Println("\n========================================================")
-	fmt.Println("🔑 TWITCH LOGIN REQUIRED FOR CLIPPING")
+	fmt.Println("TWITCH LOGIN REQUIRED FOR CLIPPING")
 	fmt.Println("========================================================")
 	fmt.Println("Opening browser for Twitch Authorization...")
 	fmt.Printf("If browser does not open automatically, visit:\n%s\n", authURL)
@@ -232,7 +232,7 @@ func (tm *TokenManager) loginViaBrowser(ctx context.Context) (*Token, error) {
 		tm.userID = val.UserID
 	}
 
-	fmt.Printf("🎉 Successfully logged in as: %s!\n\n", tm.username)
+	fmt.Printf("Successfully logged in as: %s!\n\n", tm.username)
 	return tok, nil
 }
 
