@@ -84,6 +84,65 @@ chat spam like `omgg`, `wtff`, and `WWWW` still counts without exact substring r
 
 Code: `internal/features/`.
 
+## OAuth (Twitch login)
+
+Snipr uses the **OAuth 2.0 authorization code** flow so Helix can create clips as your
+user. Chat ingest itself stays anonymous IRC (`justinfan`); the OAuth token is only for
+clipping / Helix.
+
+**Scopes requested:** `clips:edit`, `user:read:chat`, `chat:read`
+
+**Redirect URI (must match Twitch app settings):** `http://localhost:13337/callback`
+
+```text
+  You                auth-cli / TokenManager         Twitch
+   |                          |                         |
+   |  go run ./cmd/auth-cli   |                         |
+   |------------------------->|                         |
+   |                          | 1. listen :13337        |
+   |                          | 2. open authorize URL   |
+   |                          |------------------------>|
+   |  3. browser: Allow app   |                         |
+   |<---------------------------------------------------|
+   |                          | 4. redirect with ?code= |
+   |                          |<---- localhost:13337 ---|
+   |                          | 5. POST code → tokens   |
+   |                          |------------------------>|
+   |                          | 6. access + refresh     |
+   |                          |<------------------------|
+   |                          | 7. write token.json     |
+   |  logged in               |                         |
+```
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant AuthCLI as auth-cli / TokenManager
+  participant Browser
+  participant Twitch as Twitch OAuth / Helix
+  participant Disk as token.json
+
+  User->>AuthCLI: go run ./cmd/auth-cli
+  AuthCLI->>AuthCLI: Start callback HTTP :13337
+  AuthCLI->>Browser: Open authorize URL (client_id, scopes, state)
+  Browser->>Twitch: User clicks Allow
+  Twitch->>AuthCLI: GET /callback?code=...&state=...
+  AuthCLI->>Twitch: Exchange code + client_secret
+  Twitch-->>AuthCLI: access_token + refresh_token
+  AuthCLI->>Disk: Persist token.json
+  Note over AuthCLI,Disk: chat-cli later loads token.json and refreshes when expired
+```
+
+What happens after login:
+
+1. `token.json` stores access + refresh tokens (gitignored).
+2. `chat-cli` loads `.env` + `token.json` via `TokenManager`.
+3. If the access token is expired, it refreshes with the refresh token (no browser).
+4. If refresh fails / no token, it runs the same browser login again.
+5. Helix `CreateClip` calls use the access token; IRC does **not**.
+
+Code: `cmd/auth-cli`, `internal/auth/` (`TokenManager`, callback server on port **13337**).
+
 ## Quick start
 
 ### 1. Twitch app credentials
@@ -103,7 +162,7 @@ TWITCH_CLIENT_SECRET=your_client_secret
 go run ./cmd/auth-cli
 ```
 
-Browser opens → authorize `clips:edit` (and chat scopes) → token saved locally.
+See [OAuth](#oauth-twitch-login) above for the full flow.
 
 ### 3. Optional analytics
 
