@@ -79,7 +79,7 @@ Parallel NATS consumers (durable groups, Kafka-style fan-out):
 | `hype_score` | Fuzzy hype-word hits (bigram **Jaccard ≥ 0.65**) |
 | `repeat_ratio` | `(msg_count - unique_norm_msgs) / msg_count` |
 
-`hype_score` uses the ValSparks word list (plus `www`) with Jaccard fuzzy matching so
+`hype_score` uses Jaccard fuzzy matching so
 chat spam like `omgg`, `wtff`, and `WWWW` still counts without exact substring rules.
 
 Code: `internal/features/`.
@@ -151,7 +151,7 @@ feature window is scored; clips print a Twitch URL when the model fires.
 Go has no sklearn. Inference uses [`Elvenson/xgboost-go`](https://github.com/Elvenson/xgboost-go)
 plus `base_score` from the native model so probabilities match Python.
 
-Threshold **0.7**, clip cooldown **30s** (ValSparks).
+Threshold **0.7**, clip cooldown **30s**.
 
 Re-export dump format if you retrain:
 
